@@ -41,7 +41,7 @@ from ..server.jailthread import JailThread
 from ..server.ticket import BanTicket
 from ..server.utils import Utils
 from .dummyjail import DummyJail
-from .utils import LogCaptureTestCase
+from .utils import LogCaptureTestCase, with_alt_time, MyTime
 from ..helpers import getLogger, extractOptions, PREFER_ENC
 from .. import version
 
@@ -64,7 +64,7 @@ class TestServer(Server):
 		pass
 
 
-class TransmitterBase(unittest.TestCase):
+class TransmitterBase(LogCaptureTestCase):
 	
 	def setUp(self):
 		"""Call before every test case."""
@@ -197,6 +197,8 @@ class Transmitter(TransmitterBase):
 		self.setGetTest("dbfile", tmpFilename)
 		# the same file name (again no jails / not changed):
 		self.setGetTest("dbfile", tmpFilename)
+		self.setGetTest("dbmaxmatches", "100", 100)
+		self.setGetTestNOK("dbmaxmatches", "LIZARD")
 		self.setGetTest("dbpurgeage", "600", 600)
 		self.setGetTestNOK("dbpurgeage", "LIZARD")
 		# the same file name (again with jails / not changed):
@@ -210,6 +212,12 @@ class Transmitter(TransmitterBase):
 			(0, None))
 		self.assertEqual(self.transm.proceed(
 			["get", "dbfile"]),
+			(0, None))
+		self.assertEqual(self.transm.proceed(
+			["set", "dbmaxmatches", "100"]),
+			(0, None))
+		self.assertEqual(self.transm.proceed(
+			["get", "dbmaxmatches"]),
 			(0, None))
 		self.assertEqual(self.transm.proceed(
 			["set", "dbpurgeage", "500"]),
@@ -330,22 +338,99 @@ class Transmitter(TransmitterBase):
 		self.server.startJail(self.jailName) # Jail must be started
 
 		self.assertEqual(
-			self.transm.proceed(["set", self.jailName, "banip", "127.0.0.1"]),
-			(0, "127.0.0.1"))
-		time.sleep(Utils.DEFAULT_SLEEP_TIME) # Give chance to ban
+			self.transm.proceed(["set", self.jailName, "banip", "192.0.2.1", "192.0.2.1", "192.0.2.2"]),
+			(0, 2))
+		self.assertLogged("Ban 192.0.2.1", "Ban 192.0.2.2", all=True, wait=True) # Give chance to ban
 		self.assertEqual(
 			self.transm.proceed(["set", self.jailName, "banip", "Badger"]),
-			(0, "Badger")) #NOTE: Is IP address validated? Is DNS Lookup done?
-		time.sleep(Utils.DEFAULT_SLEEP_TIME) # Give chance to ban
-		# Unban IP
+			(0, 1)) #NOTE: Is IP address validated? Is DNS Lookup done?
+		self.assertLogged("Ban Badger", wait=True) # Give chance to ban
+		# Unban IP (first/last are not banned, so checking unban of both other succeeds):
 		self.assertEqual(
 			self.transm.proceed(
-				["set", self.jailName, "unbanip", "127.0.0.1"]),
-			(0, "127.0.0.1"))
-		# Unban IP which isn't banned
+				["set", self.jailName, "unbanip", "192.0.2.255", "192.0.2.1", "192.0.2.2", "192.0.2.254"]),
+			(0, 2))
+		self.assertLogged("Unban 192.0.2.1", "Unban 192.0.2.2", all=True, wait=True)
+		self.assertLogged("192.0.2.255 is not banned", "192.0.2.254 is not banned", all=True, wait=True)
+		self.pruneLog()
+		# Unban IP which isn't banned (error):
 		self.assertEqual(
 			self.transm.proceed(
-				["set", self.jailName, "unbanip", "192.168.1.1"])[0],1)
+				["set", self.jailName, "unbanip", "--report-absent", "192.0.2.255"])[0],1)
+		# ... (no error, IPs logged only):
+		self.assertEqual(
+			self.transm.proceed(
+				["set", self.jailName, "unbanip", "192.0.2.255", "192.0.2.254"]),(0, 0))
+		self.assertLogged("192.0.2.255 is not banned", "192.0.2.254 is not banned", all=True, wait=True)
+
+	def testJailAttemptIP(self):
+		self.server.startJail(self.jailName) # Jail must be started
+
+		def attempt(ip, matches):
+			return self.transm.proceed(["set", self.jailName, "attempt", ip] + matches)
+
+		self.setGetTest("maxretry", "5", 5, jail=self.jailName)
+		# produce 2 single attempts per IP:
+		for i in (1, 2):
+			for ip in ("192.0.2.1", "192.0.2.2"):
+				self.assertEqual(attempt(ip, ["test failure %d" % i]), (0, 1))
+		self.assertLogged("192.0.2.1:2", "192.0.2.2:2", all=True, wait=True)
+		# this 3 attempts at once should cause a ban:
+		self.assertEqual(attempt(ip, ["test failure %d" % i for i in (3,4,5)]), (0, 1))
+		self.assertLogged("192.0.2.2:5", wait=True)
+		# resulted to ban for "192.0.2.2" but not for "192.0.2.1":
+		self.assertLogged("Ban 192.0.2.2", wait=True)
+		self.assertNotLogged("Ban 192.0.2.1")
+
+	@with_alt_time
+	def testJailBanList(self):
+		jail = "TestJailBanList"
+		self.server.addJail(jail, FAST_BACKEND)
+		self.server.startJail(jail)
+
+		# Helper to process set banip/set unbanip commands and compare the list of
+		# banned IP addresses with outList.
+		def _getBanListTest(jail, banip=None, unbanip=None, args=(), outList=[]):
+			# Ban IP address
+			if banip is not None:
+				self.assertEqual(
+					self.transm.proceed(["set", jail, "banip", banip]),
+					(0, 1))
+				self.assertLogged("Ban %s" % banip, wait=True) # Give chance to ban
+			# Unban IP address
+			if unbanip is not None:
+				self.assertEqual(
+					self.transm.proceed(["set", jail, "unbanip", unbanip]),
+					(0, 1))
+				self.assertLogged("Unban %s" % unbanip, wait=True) # Give chance to unban
+			# Compare the list of banned IP addresses with outList
+			self.assertSortedEqual(
+				self.transm.proceed(["get", jail, "banip"]+list(args)),
+				(0, outList), nestedOnly=False)
+			MyTime.setTime(MyTime.time() + 1)
+
+		_getBanListTest(jail,
+			outList=[])
+		_getBanListTest(jail, banip="127.0.0.1", args=('--with-time',), 
+			outList=["127.0.0.1 \t2005-08-14 12:00:01 + 600 = 2005-08-14 12:10:01"])
+		_getBanListTest(jail, banip="192.168.0.1", args=('--with-time',), 
+			outList=[
+				"127.0.0.1 \t2005-08-14 12:00:01 + 600 = 2005-08-14 12:10:01",
+				"192.168.0.1 \t2005-08-14 12:00:02 + 600 = 2005-08-14 12:10:02"])
+		_getBanListTest(jail, banip="192.168.1.10",
+			outList=["127.0.0.1", "192.168.0.1", "192.168.1.10"])
+		_getBanListTest(jail, unbanip="127.0.0.1",
+			outList=["192.168.0.1", "192.168.1.10"])
+		_getBanListTest(jail, unbanip="192.168.1.10",
+			outList=["192.168.0.1"])
+		_getBanListTest(jail, unbanip="192.168.0.1",
+			outList=[])
+
+	def testJailMaxMatches(self):
+		self.setGetTest("maxmatches", "5", 5, jail=self.jailName)
+		self.setGetTest("maxmatches", "2", 2, jail=self.jailName)
+		self.setGetTest("maxmatches", "-2", -2, jail=self.jailName)
+		self.setGetTestNOK("maxmatches", "Duck", jail=self.jailName)
 
 	def testJailMaxRetry(self):
 		self.setGetTest("maxretry", "5", 5, jail=self.jailName)
@@ -985,28 +1070,28 @@ class RegexTests(unittest.TestCase):
 	def testHost(self):
 		self.assertRaises(RegexException, FailRegex, '')
 		self.assertRaises(RegexException, FailRegex, '^test no group$')
-		self.assertTrue(FailRegex('^test <HOST> group$'))
-		self.assertTrue(FailRegex('^test <IP4> group$'))
-		self.assertTrue(FailRegex('^test <IP6> group$'))
-		self.assertTrue(FailRegex('^test <DNS> group$'))
-		self.assertTrue(FailRegex('^test id group: ip:port = <F-ID><IP4>(?::<F-PORT/>)?</F-ID>$'))
-		self.assertTrue(FailRegex('^test id group: user:\(<F-ID>[^\)]+</F-ID>\)$'))
-		self.assertTrue(FailRegex('^test id group: anything = <F-ID/>$'))
+		self.assertTrue(FailRegex(r'^test <HOST> group$'))
+		self.assertTrue(FailRegex(r'^test <IP4> group$'))
+		self.assertTrue(FailRegex(r'^test <IP6> group$'))
+		self.assertTrue(FailRegex(r'^test <DNS> group$'))
+		self.assertTrue(FailRegex(r'^test id group: ip:port = <F-ID><IP4>(?::<F-PORT/>)?</F-ID>$'))
+		self.assertTrue(FailRegex(r'^test id group: user:\(<F-ID>[^\)]+</F-ID>\)$'))
+		self.assertTrue(FailRegex(r'^test id group: anything = <F-ID/>$'))
 		# Testing obscure case when host group might be missing in the matched pattern,
 		# e.g. if we made it optional.
-		fr = FailRegex('%%<HOST>?')
+		fr = FailRegex(r'%%<HOST>?')
 		self.assertFalse(fr.hasMatched())
 		fr.search([('%%',"","")])
 		self.assertTrue(fr.hasMatched())
 		self.assertRaises(RegexException, fr.getHost)
 		# The same as above but using separated IPv4/IPv6 expressions
-		fr = FailRegex('%%inet(?:=<F-IP4/>|inet6=<F-IP6/>)?')
+		fr = FailRegex(r'%%inet(?:=<F-IP4/>|inet6=<F-IP6/>)?')
 		self.assertFalse(fr.hasMatched())
 		fr.search([('%%inet=test',"","")])
 		self.assertTrue(fr.hasMatched())
 		self.assertRaises(RegexException, fr.getHost)
 		# Success case: using separated IPv4/IPv6 expressions (no HOST)
-		fr = FailRegex('%%(?:inet(?:=<IP4>|6=<IP6>)?|dns=<DNS>?)')
+		fr = FailRegex(r'%%(?:inet(?:=<IP4>|6=<IP6>)?|dns=<DNS>?)')
 		self.assertFalse(fr.hasMatched())
 		fr.search([('%%inet=192.0.2.1',"","")])
 		self.assertTrue(fr.hasMatched())
@@ -1018,7 +1103,7 @@ class RegexTests(unittest.TestCase):
 		self.assertTrue(fr.hasMatched())
 		self.assertEqual(fr.getHost(), 'example.com')
 		# Success case: using user as failure-id
-		fr = FailRegex('^test id group: user:\(<F-ID>[^\)]+</F-ID>\)$')
+		fr = FailRegex(r'^test id group: user:\(<F-ID>[^\)]+</F-ID>\)$')
 		self.assertFalse(fr.hasMatched())
 		fr.search([('test id group: user:(test login name)',"","")])
 		self.assertTrue(fr.hasMatched())
@@ -1853,12 +1938,19 @@ class ServerConfigReaderTests(LogCaptureTestCase):
 
 	def _executeMailCmd(self, realCmd, timeout=60):
 		# replace pipe to mail with pipe to cat:
-		realCmd = re.sub(r'\)\s*\|\s*mail\b([^\n]*)',
-			r') | cat; printf "\\n... | "; echo mail \1', realCmd)
+		cmd = realCmd
+		if isinstance(realCmd, list):
+			cmd = realCmd[0]
+		cmd = re.sub(r'\)\s*\|\s*mail\b([^\n]*)',
+			r') | cat; printf "\\n... | "; echo mail \1', cmd)
 		# replace abuse retrieving (possible no-network), just replace first occurrence of 'dig...':
-		realCmd = re.sub(r'\bADDRESSES=\$\(dig\s[^\n]+',
+		cmd = re.sub(r'\bADDRESSES=\$\(dig\s[^\n]+',
 			lambda m: 'ADDRESSES="abuse-1@abuse-test-server, abuse-2@abuse-test-server"',
-				realCmd, 1)
+				cmd, 1)
+		if isinstance(realCmd, list):
+			realCmd[0] = cmd
+		else:
+			realCmd = cmd
 		# execute action:
 		return _actions.CommandAction.executeCmd(realCmd, timeout=timeout)
 
@@ -1913,6 +2005,31 @@ class ServerConfigReaderTests(LogCaptureTestCase):
 					'mail -s Hostname: test-host, family: inet6 - Abuse from 2001:db8::1 abuse-1@abuse-test-server abuse-2@abuse-test-server',
 				),
 			}),
+			# xarf-login-attack --
+			('j-xarf-abuse', 
+				'xarf-login-attack['
+				  'name=%(__name__)s, mailcmd="mail", mailargs="",' +
+				  # test reverse ip:
+				  'debug=1' +
+				  ']',
+			{
+				'ip4-ban': (
+					# test reverse ip:
+					'try to resolve 10.124.142.87.abuse-contacts.abusix.org',
+					'We have detected abuse from the IP address 87.142.124.10',
+					'Dec 31 11:59:59 [sshd] error: PAM: Authentication failure for kevin from 87.142.124.10',
+					'Dec 31 11:55:01 [sshd] error: PAM: Authentication failure for test from 87.142.124.10',
+					# both abuse mails should be separated with space:
+					'mail abuse-1@abuse-test-server abuse-2@abuse-test-server',
+				),
+				'ip6-ban': (
+					# test reverse ip:
+					'try to resolve 1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.abuse-contacts.abusix.org',
+					'We have detected abuse from the IP address 2001:db8::1',
+					# both abuse mails should be separated with space:
+					'mail abuse-1@abuse-test-server abuse-2@abuse-test-server',
+				),
+			}),
 		)
 		server = TestServer()
 		transm = server._Server__transm
@@ -1950,6 +2067,10 @@ class ServerConfigReaderTests(LogCaptureTestCase):
 					self.pruneLog('# === %s ===' % test)
 					ticket = BanTicket(ip)
 					ticket.setAttempt(100)
+					ticket.setMatches([
+						'Dec 31 11:59:59 [sshd] error: PAM: Authentication failure for kevin from 87.142.124.10',
+						'Dec 31 11:55:01 [sshd] error: PAM: Authentication failure for test from 87.142.124.10'
+					])
 					ticket = _actions.Actions.ActionInfo(ticket, dmyjail)
 					action.ban(ticket)
 					self.assertLogged(*tests[test], all=True)

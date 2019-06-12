@@ -155,7 +155,7 @@ def _out_file(fn, handle=logSys.debug):
 
 def _write_file(fn, mode, *lines):
 	f = open(fn, mode)
-	f.write('\n'.join(lines))
+	f.write('\n'.join(lines)+('\n' if lines else ''))
 	f.close()
 
 def _read_file(fn):
@@ -169,7 +169,8 @@ def _read_file(fn):
 
 
 def _start_params(tmp, use_stock=False, use_stock_cfg=None, 
-	logtarget="/dev/null", db=":memory:", jails=("",), create_before_start=None
+	logtarget="/dev/null", db=":memory:", f2b_local=(), jails=("",), 
+	create_before_start=None,
 ):
 	cfg = pjoin(tmp, "config")
 	if db == 'auto':
@@ -207,6 +208,7 @@ def _start_params(tmp, use_stock=False, use_stock_cfg=None,
 			"pidfile = " + pjoin(tmp, "f2b.pid"),
 			"backend = polling",
 			"dbfile = " + db,
+			"dbmaxmatches = 100",
 			"dbpurgeage = 1d",
 			"",
 		)
@@ -219,6 +221,9 @@ def _start_params(tmp, use_stock=False, use_stock_cfg=None,
 		if unittest.F2B.log_level < logging.DEBUG: # pragma: no cover
 			_out_file(pjoin(cfg, "fail2ban.conf"))
 			_out_file(pjoin(cfg, "jail.conf"))
+	if f2b_local:
+		_write_file(pjoin(cfg, "fail2ban.local"), "w", *f2b_local)
+
 	# link stock actions and filters:
 	if use_stock_cfg and STOCK:
 		for n in use_stock_cfg:
@@ -462,8 +467,16 @@ class Fail2banClientServerBase(LogCaptureTestCase):
 			phase['end'] = True
 			logSys.debug("end of test worker")
 
-	@with_foreground_server_thread()
+	@with_foreground_server_thread(startextra={'f2b_local':(
+			"[Thread]",
+			"stacksize = 32"
+			"",
+		)})
 	def testStartForeground(self, tmp, startparams):
+		# check thread options were set:
+		self.pruneLog()
+		self.execCmd(SUCCESS, startparams, "get", "thread")
+		self.assertLogged("{'stacksize': 32}")
 		# several commands to server:
 		self.execCmd(SUCCESS, startparams, "ping")
 		self.execCmd(FAILED, startparams, "~~unknown~cmd~failed~~")
@@ -853,7 +866,7 @@ class Fail2banServerTest(Fail2banClientServerBase):
 				"usedns = no",
 				"maxretry = 3",
 				"findtime = 10m",
-				"failregex = ^\s*failure <F-ERRCODE>401|403</F-ERRCODE> from <HOST>",
+				r"failregex = ^\s*failure <F-ERRCODE>401|403</F-ERRCODE> from <HOST>",
 				"datepattern = {^LN-BEG}EPOCH",
 				"ignoreip = 127.0.0.1/8 ::1", # just to cover ignoreip in jailreader/transmitter
 				"",
@@ -869,8 +882,8 @@ class Fail2banServerTest(Fail2banClientServerBase):
 				"logpath = " + test1log,
 				"          " + test2log if 2 in enabled else "",
 				"          " + test3log if 2 in enabled else "",
-				"failregex = ^\s*failure <F-ERRCODE>401|403</F-ERRCODE> from <HOST>",
-				"            ^\s*error <F-ERRCODE>401|403</F-ERRCODE> from <HOST>" \
+				r"failregex = ^\s*failure <F-ERRCODE>401|403</F-ERRCODE> from <HOST>",
+				r"            ^\s*error <F-ERRCODE>401|403</F-ERRCODE> from <HOST>" \
 					if 2 in enabled else "",
 				"enabled = true" if 1 in enabled else "",
 				"",
@@ -1064,6 +1077,17 @@ class Fail2banServerTest(Fail2banClientServerBase):
 			"stdout: '[test-jail2] test-action3: ++ ban 192.0.2.22",
 			"stdout: '[test-jail2] test-action3: ++ ban 192.0.2.22 ", all=True, wait=MID_WAITTIME)
 
+		# get banned ips:
+		_observer_wait_idle()
+		self.pruneLog("[test-phase 2d.1]")
+		self.execCmd(SUCCESS, startparams, "get", "test-jail2", "banip", "\n")
+		self.assertLogged(
+			"192.0.2.4", "192.0.2.8", "192.0.2.21", "192.0.2.22", all=True, wait=MID_WAITTIME)
+		self.pruneLog("[test-phase 2d.2]")
+		self.execCmd(SUCCESS, startparams, "get", "test-jail1", "banip")
+		self.assertLogged(
+			"192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4", "192.0.2.8", all=True, wait=MID_WAITTIME)
+
 		# restart jail with unban all:
 		self.pruneLog("[test-phase 2e]")
 		self.execCmd(SUCCESS, startparams,
@@ -1154,7 +1178,7 @@ class Fail2banServerTest(Fail2banClientServerBase):
 			"--async", "unban", "192.0.2.5", "192.0.2.6")
 		self.assertLogged(
 			"192.0.2.5 is not banned",
-			"[test-jail1] Unban 192.0.2.6", all=True
+			"[test-jail1] Unban 192.0.2.6", all=True, wait=MID_WAITTIME
 		)
 
 		# reload all (one jail) with unban all:
@@ -1226,6 +1250,14 @@ class Fail2banServerTest(Fail2banClientServerBase):
 		self.assertLogged(
 			"Jail 'test-jail1' stopped", 
 			"Jail 'test-jail1' started", all=True, wait=MID_WAITTIME)
+
+		# Coverage for pickle of IPAddr (as string):
+		self.pruneLog("[test-phase end-3]")
+		self.execCmd(SUCCESS, startparams,
+			"--async", "set", "test-jail1", "addignoreip", "192.0.2.1/32", "2001:DB8::1/96")
+		self.execCmd(SUCCESS, startparams,
+			"--async", "get", "test-jail1", "ignoreip")
+		self.assertLogged("192.0.2.1/32", "2001:DB8::1/96", all=True)
 
 	# test action.d/nginx-block-map.conf --
 	@unittest.F2B.skip_if_cfg_missing(action="nginx-block-map")
@@ -1343,7 +1375,7 @@ class Fail2banServerTest(Fail2banClientServerBase):
 				"action = test-action1[name='%(__name__)s']",
 				"         test-action2[name='%(__name__)s']",
 				"logpath = " + test1log,
-				"failregex = ^\s*failure <F-ERRCODE>401|403</F-ERRCODE> from <HOST>:\s*<F-MSG>.*</F-MSG>$",
+				r"failregex = ^\s*failure <F-ERRCODE>401|403</F-ERRCODE> from <HOST>:\s*<F-MSG>.*</F-MSG>$",
 				"enabled = true",
 				"",
 			)
@@ -1397,6 +1429,11 @@ class Fail2banServerTest(Fail2banClientServerBase):
 			"stdout: '[test-jail1] test-action1: ++ ban 192.0.2.11 -c 2 -t 300 : ",
 			"stdout: '[test-jail1] test-action2: ++ ban 192.0.2.11 -c 2 -t 300 : ",
 			all=True, wait=MID_WAITTIME)
+		# get banned ips with time:
+		self.pruneLog("[test-phase 2) time+10m - get-ips]")
+		self.execCmd(SUCCESS, startparams, "get", "test-jail1", "banip", "--with-time")
+		self.assertLogged(
+			"192.0.2.11", "+ 300 =", all=True, wait=MID_WAITTIME)
 		# unblock observer here and wait it is done:
 		wakeObs = True
 		_observer_wait_idle()
@@ -1410,6 +1447,13 @@ class Fail2banServerTest(Fail2banClientServerBase):
 		self.assertLogged(
 			"stdout: '[test-jail1] test-action2: ++ prolong 192.0.2.11 -c 2 -t 600 : ",
 			all=True, wait=MID_WAITTIME)
+
+		# get banned ips with time:
+		_observer_wait_idle()
+		self.pruneLog("[test-phase 2) time+11m - get-ips]")
+		self.execCmd(SUCCESS, startparams, "get", "test-jail1", "banip", "--with-time")
+		self.assertLogged(
+			"192.0.2.11", "+ 600 =", all=True, wait=MID_WAITTIME)
 
 	# test multiple start/stop of the server (threaded in foreground) --
 	if False: # pragma: no cover

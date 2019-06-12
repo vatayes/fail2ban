@@ -28,7 +28,8 @@ import re
 import shutil
 import tempfile
 import unittest
-from ..client.configreader import ConfigReader, ConfigReaderUnshared, NoSectionError
+from ..client.configreader import ConfigReader, ConfigReaderUnshared, \
+	DefinitionInitConfigReader, NoSectionError
 from ..client import configparserinc
 from ..client.jailreader import JailReader, extractOptions
 from ..client.filterreader import FilterReader
@@ -124,6 +125,54 @@ option = %s
 		self.assertEqual(self._getoption(), 990)
 		self._remove("c.d/90.conf")
 		self.assertEqual(self._getoption(), 2)
+
+	def testLocalInIncludes(self):
+		self._write("c.conf", value=None, content="""
+[INCLUDES]
+before = ib.conf
+after  = ia.conf
+[Definition]
+test = %(default/test)s
+""")
+		self._write("ib.conf", value=None, content="""
+[DEFAULT]
+test = A
+[Definition]
+option = 1
+""")
+		self._write("ib.local", value=None, content="""
+[DEFAULT]
+test = B
+[Definition]
+option = 2
+""")
+		self._write("ia.conf", value=None, content="""
+[DEFAULT]
+test = C
+[Definition]
+oafter = 3
+""")
+		self._write("ia.local", value=None, content="""
+[DEFAULT]
+test = D
+[Definition]
+oafter = 4
+""")
+		class TestDefConfReader(DefinitionInitConfigReader):
+			_configOpts = {
+			  "option": ["int", None],
+			  "oafter": ["int", None],
+				"test":   ["string", None],
+			}
+		self.c = TestDefConfReader('c', 'option', {})
+		self.c.setBaseDir(self.d)
+		self.assertTrue(self.c.read())
+		self.c.getOptions({}, all=True)
+		o = self.c.getCombined()
+		# test local wins (overwrite all options):
+		self.assertEqual(o.get('option'), 2)
+		self.assertEqual(o.get('oafter'), 4)
+		self.assertEqual(o.get('test'), 'D')
 
 	def testInterpolations(self):
 		self.assertFalse(self.c.read('i'))	# nothing is there yet
@@ -303,6 +352,30 @@ class JailReaderTest(LogCaptureTestCase):
 		 dict((k, v.replace(',', '][')) for k, v in expected[1].iteritems())
 		)
 		self.assertEqual(expected2, result)
+
+	def testMultiLineOption(self):
+		jail = JailReader('multi-log', force_enable=True, basedir=IMPERFECT_CONFIG, share_config=IMPERFECT_CONFIG_SHARE_CFG)
+		self.assertTrue(jail.read())
+		self.assertTrue(jail.getOptions())
+		self.assertEqual(jail.options['logpath'], 'a.log\nb.log\nc.log')
+		self.assertEqual(jail.options['action'], 'action[actname=\'ban\']\naction[actname=\'log\', logpath="a.log\nb.log\nc.log\nd.log"]\naction[actname=\'test\']')
+		self.assertSortedEqual([a.convert() for a in jail._JailReader__actions], [
+			[['set', 'multi-log', 'addaction', 'ban'], ['multi-set', 'multi-log', 'action', 'ban', [
+				['actionban', 'echo "name: ban, ban: <ip>, logs: a.log\nb.log\nc.log"'],
+				['actname', 'ban'],
+				['name', 'multi-log']
+			]]],
+			[['set', 'multi-log', 'addaction', 'log'], ['multi-set', 'multi-log', 'action', 'log', [
+				['actionban', 'echo "name: log, ban: <ip>, logs: a.log\nb.log\nc.log\nd.log"'],
+				['actname', 'log'],
+				['logpath', 'a.log\nb.log\nc.log\nd.log'], ['name', 'multi-log']
+			]]],
+			[['set', 'multi-log', 'addaction', 'test'], ['multi-set', 'multi-log', 'action', 'test', [
+				['actionban', 'echo "name: test, ban: <ip>, logs: a.log\nb.log\nc.log"'],
+				['actname', 'test'],
+				['name', 'multi-log']
+			]]]
+		])
 
 	def testVersionAgent(self):
 		unittest.F2B.SkipIfCfgMissing(stock=True)
@@ -805,21 +878,23 @@ class JailsReaderTest(LogCaptureTestCase):
 							 % (option, commands))
 
 		# Set up of logging should come first
-		self.assertEqual(find_set('syslogsocket'), 0)
-		self.assertEqual(find_set('loglevel'), 1)
-		self.assertEqual(find_set('logtarget'), 2)
-		# then dbfile should be before dbpurgeage
+		self.assertTrue(
+			find_set('syslogsocket') < find_set('loglevel') < find_set('logtarget')
+		)
+		# then dbfile should be before dbmaxmatches and dbpurgeage
 		self.assertTrue(find_set('dbpurgeage') > find_set('dbfile'))
+		self.assertTrue(find_set('dbmaxmatches') > find_set('dbfile'))
 
 		# and there is logging information left to be passed into the
 		# server
-		self.assertSortedEqual(commands,
-						 [['set', 'dbfile',
-							'/var/lib/fail2ban/fail2ban.sqlite3'],
-						  ['set', 'dbpurgeage', '1d'],
-						  ['set', 'loglevel', "INFO"],
-						  ['set', 'logtarget', '/var/log/fail2ban.log'],
-						  ['set', 'syslogsocket', 'auto']])
+		self.assertSortedEqual(commands,[
+		  ['set', 'syslogsocket', 'auto'],
+		  ['set', 'loglevel', "INFO"],
+		  ['set', 'logtarget', '/var/log/fail2ban.log'],
+		  ['set', 'dbfile', '/var/lib/fail2ban/fail2ban.sqlite3'],
+		  ['set', 'dbmaxmatches', 10],
+		  ['set', 'dbpurgeage', '1d'],
+		 ])
 
 		# and if we force change configurator's fail2ban's baseDir
 		# there should be an error message (test visually ;) --

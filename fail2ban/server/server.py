@@ -459,6 +459,12 @@ class Server:
 	def getUseDns(self, name):
 		return self.__jails[name].filter.getUseDns()
 	
+	def setMaxMatches(self, name, value):
+		self.__jails[name].filter.failManager.maxMatches = value
+	
+	def getMaxMatches(self, name):
+		return self.__jails[name].filter.failManager.maxMatches
+	
 	def setMaxRetry(self, name, value):
 		self.__jails[name].filter.setMaxRetry(value)
 	
@@ -489,26 +495,43 @@ class Server:
 	def setBanTime(self, name, value):
 		self.__jails[name].actions.setBanTime(value)
 	
+	def addAttemptIP(self, name, *args):
+		return self.__jails[name].filter.addAttempt(*args)
+
 	def setBanIP(self, name, value):
-		return self.__jails[name].filter.addBannedIP(value)
-		
-	def setUnbanIP(self, name=None, value=None):
+		return self.__jails[name].actions.addBannedIP(value)
+
+	def setUnbanIP(self, name=None, value=None, ifexists=True):
 		if name is not None:
-			# in all jails:
+			# single jail:
 			jails = [self.__jails[name]]
 		else:
-			# single jail:
+			# in all jails:
 			jails = self.__jails.values()
 		# unban given or all (if value is None):
 		cnt = 0
+		ifexists |= (name is None)
 		for jail in jails:
-			cnt += jail.actions.removeBannedIP(value, ifexists=(name is None))
-		if value and not cnt:
-			logSys.info("%s is not banned", value)
+			cnt += jail.actions.removeBannedIP(value, ifexists=ifexists)
 		return cnt
 		
 	def getBanTime(self, name):
 		return self.__jails[name].actions.getBanTime()
+
+	def getBanList(self, name, withTime=False):
+		"""Returns the list of banned IP addresses for a jail.
+
+		Parameters
+		----------
+		name : str
+			The name of a jail.
+
+		Returns
+		-------
+		list
+			The list of banned IP addresses.
+		"""
+		return self.__jails[name].actions.getBanList(withTime)
 
 	def setBanTimeExtra(self, name, opt, value):
 		self.__jails[name].setBanTimeExtra(opt, value)
@@ -729,6 +752,16 @@ class Server:
 				logSys.info("flush performed on %s" % self.__logTarget)
 			return "flushed"
 			
+	def setThreadOptions(self, value):
+		for o, v in value.iteritems():
+			if o == 'stacksize':
+				threading.stack_size(int(v)*1024)
+			else: # pragma: no cover
+				raise KeyError("unknown option %r" % o)
+
+	def getThreadOptions(self):
+		return {'stacksize': threading.stack_size() // 1024}
+
 	def setDatabase(self, filename):
 		# if not changed - nothing to do
 		if self.__db and self.__db.filename == filename:

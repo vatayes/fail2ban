@@ -102,9 +102,22 @@ class BanManager:
 	#
 	# @return IP list
 	
-	def getBanList(self):
+	def getBanList(self, ordered=False, withTime=False):
 		with self.__lock:
-			return self.__banList.keys()
+			if not ordered:
+				return self.__banList.keys()
+			lst = []
+			for ticket in self.__banList.itervalues():
+				eob = ticket.getEndOfBanTime(self.__banTime)
+				lst.append((ticket,eob))
+			lst.sort(key=lambda t: t[1])
+			t2s = MyTime.time2str
+			if withTime:
+				return ['%s \t%s + %d = %s' % (
+						t[0].getID(), 
+						t2s(t[0].getTime()), t[0].getBanTime(self.__banTime), t2s(t[1])
+					) for t in lst]
+			return [t[0].getID() for t in lst]
 
 	##
 	# Returns a iterator to ban list (used in reload, so idle).
@@ -314,27 +327,32 @@ class BanManager:
 	# @param time the time
 	# @return the list of ticket to unban
 	
-	def unBanList(self, time):
+	def unBanList(self, time, maxCount=0x7fffffff):
 		with self.__lock:
 			# Permanent banning
 			if self.__banTime < 0:
 				return list()
 
 			# Check next unban time:
-			if self.__nextUnbanTime > time:
+			nextUnbanTime = self.__nextUnbanTime
+			if nextUnbanTime > time:
 				return list()
 
 			# Gets the list of ticket to remove (thereby correct next unban time).
 			unBanList = {}
-			self.__nextUnbanTime = BanTicket.MAX_TIME
+			nextUnbanTime = BanTicket.MAX_TIME
 			for fid,ticket in self.__banList.iteritems():
 				# current time greater as end of ban - timed out:
 				eob = ticket.getEndOfBanTime(self.__banTime)
 				if time > eob:
 					unBanList[fid] = ticket
-				elif self.__nextUnbanTime > eob:
-					self.__nextUnbanTime = eob
+					if len(unBanList) >= maxCount: # stop search cycle, so reset back the next check time
+						nextUnbanTime = self.__nextUnbanTime
+						break
+				elif nextUnbanTime > eob:
+					nextUnbanTime = eob
 
+			self.__nextUnbanTime = nextUnbanTime
 			# Removes tickets.
 			if len(unBanList):
 				if len(unBanList) / 2.0 <= len(self.__banList) / 3.0:
